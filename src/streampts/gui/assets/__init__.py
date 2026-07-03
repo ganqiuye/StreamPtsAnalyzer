@@ -1,0 +1,1 @@
+"""GUI static assets (logo)."""

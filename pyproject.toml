@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streampts"
+version = "0.1.0"
+description = "Analyze media PTS with ffprobe and interactive HTML reports"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+    "plotly>=5.18",
+    "tomli>=2.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "customtkinter>=5.2",
+    "tkinterdnd2>=0.4.2",
+]
+build = [
+    "pyinstaller>=6.0",
+]
+
+[project.scripts]
+streampts = "streampts.cli:main"
+streampts-gui = "streampts.gui.launcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

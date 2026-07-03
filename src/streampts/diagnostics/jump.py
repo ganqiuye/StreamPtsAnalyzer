@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import statistics
+
+from streampts.config import JumpConfig
+from streampts.models import (
+    DiscontinuityEvent,
+    JumpSeverity,
+    JumpType,
+    SeriesPoint,
+    StreamDiagnostics,
+)
+from streampts.utils.units import ms_from_pts_delta
+
+
+def _median_positive(deltas: list[int]) -> float:
+    pos = [d for d in deltas if d > 0]
+    if not pos:
+        return 3600.0  # 40ms @ 90k
+    return float(statistics.median(pos))
+
+
+def detect_jumps(
+    stream_index: int,
+    points: list[SeriesPoint],
+    config: JumpConfig,
+) -> StreamDiagnostics:
+    if not points:
+        return StreamDiagnostics(stream_index=stream_index, packet_count=0)
+
+    sorted_pts = sorted(points, key=lambda p: (p.pts_time, p.packet_index))
+    deltas = [
+        sorted_pts[i].pts - sorted_pts[i - 1].pts for i in range(1, len(sorted_pts))
+    ]
+    median = _median_positive(deltas)
+    relative_threshold = median * config.factor
+    min_pts = config.min_ms * 90.0
+    max_pts = config.max_ms * 90.0 if config.max_ms is not None else None
+
+    events: list[DiscontinuityEvent] = []
+    for i in range(1, len(sorted_pts)):
+        prev_pt = sorted_pts[i - 1]
+        curr = sorted_pts[i]
+        delta = curr.pts - prev_pt.pts
+        delta_ms = ms_from_pts_delta(delta)
+        has_disc_flag = "D" in curr.flags.upper() or "D" in prev_pt.flags.upper()
+
+        if has_disc_flag:
+            events.append(
+                DiscontinuityEvent(
+                    stream_index=stream_index,
+                    packet_index=curr.packet_index,
+                    pts=curr.pts,
+                    pts_time=curr.pts_time,
+                    jump_type=JumpType.DISCONTINUITY,
+                    severity=JumpSeverity.SEVERE,
+                    delta_pts=delta,
+                    delta_ms=delta_ms,
+                    flags=curr.flags,
+                    prev_pts=prev_pt.pts,
+                    prev_pts_time=prev_pt.pts_time,
+                    prev_packet_index=prev_pt.packet_index,
+                )
+            )
+            continue
+
+        if delta < 0:
+            events.append(
+                DiscontinuityEvent(
+                    stream_index=stream_index,
+                    packet_index=curr.packet_index,
+                    pts=curr.pts,
+                    pts_time=curr.pts_time,
+                    jump_type=JumpType.BACKWARD,
+                    severity=JumpSeverity.SEVERE,
+                    delta_pts=delta,
+                    delta_ms=delta_ms,
+                    flags=curr.flags,
+                    prev_pts=prev_pt.pts,
+                    prev_pts_time=prev_pt.pts_time,
+                    prev_packet_index=prev_pt.packet_index,
+                )
+            )
+            continue
+
+        if delta <= min_pts:
+            continue
+
+        is_jump = delta > relative_threshold
+        if not is_jump:
+            continue
+
+        if max_pts is not None and delta > max_pts:
+            severity = JumpSeverity.SEVERE
+        elif delta > relative_threshold:
+            severity = JumpSeverity.OBVIOUS
+        else:
+            severity = JumpSeverity.MINOR
+
+        events.append(
+            DiscontinuityEvent(
+                stream_index=stream_index,
+                packet_index=curr.packet_index,
+                pts=curr.pts,
+                pts_time=curr.pts_time,
+                jump_type=JumpType.JUMP,
+                severity=severity,
+                delta_pts=delta,
+                delta_ms=delta_ms,
+                flags=curr.flags,
+                prev_pts=prev_pt.pts,
+                prev_pts_time=prev_pt.pts_time,
+                prev_packet_index=prev_pt.packet_index,
+            )
+        )
+
+    return StreamDiagnostics(
+        stream_index=stream_index,
+        packet_count=len(sorted_pts),
+        jumps=events,
+    )
+
+
+def top_annotated_jumps(
+    diagnostics: StreamDiagnostics, annotate_top: int
+) -> set[int]:
+    """Return packet indices that receive text labels on chart."""
+    ranked = sorted(
+        diagnostics.jumps,
+        key=lambda e: abs(e.delta_pts),
+        reverse=True,
+    )
+    return {e.packet_index for e in ranked[:annotate_top]}
