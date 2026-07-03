@@ -4,6 +4,9 @@
 
 支持 MPEG-TS、AVI、MKV、MP4 等常见封装；PCR 分析仅适用于 MPEG-TS。
 
+<img width="2540" height="1223" alt="QQ_1783057930465" src="https://github.com/user-attachments/assets/7c7e94a2-7ab2-404e-94ba-4d82c992a2ca" />
+
+
 ## 系统要求
 
 - Windows 10/11（GUI / 打包 exe）
