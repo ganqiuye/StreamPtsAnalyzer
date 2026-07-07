@@ -105,7 +105,7 @@ ffprobe_path = ""
 
 ## 报告功能
 
-- 同图 / 分开布局，按 Program / Stream 筛选
+- 同图 / 分开布局，按 Program / Stream 筛选（Stream 可多选）
 - Video / Audio / PCR PTS 曲线（PCR 仅 TS）
 - 跳变、回退、不连续标记
 - A-V 同步偏差、PCR 间隔子图

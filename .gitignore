@@ -10,3 +10,5 @@ packaging/tools/
 *.pts-report.html
 .venv/
 venv/
+# Chimera Amlogic Coding Assistant session data
+.chimera/

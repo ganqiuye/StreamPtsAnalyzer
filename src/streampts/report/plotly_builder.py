@@ -979,9 +979,12 @@ def build_controls_html(
     <label for="program-select">Program</label>
     <select id="program-select">{options}</select>
   </div>
-  <div class="ctrl-group">
-    <label for="stream-select">Stream</label>
-    <select id="stream-select"><option value="all">全部 Stream</option></select>
+  <div class="ctrl-group" id="stream-multiselect">
+    <span class="ctrl-label">Stream</span>
+    <div class="ms-wrap">
+      <button type="button" id="stream-ms-toggle">全部 Stream</button>
+      <div class="ms-panel hidden" id="stream-ms-panel"></div>
+    </div>
   </div>
   <div class="ctrl-group">
     <span class="ctrl-label">PTS 单位</span>
@@ -1082,7 +1085,7 @@ def build_summary_html(
   </div>
   {notes}
   <div class="help">
-    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / Stream · 分开布局按 Stream 分行 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
+    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · 分开布局按 Stream 分行 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
   </div>
 </header>
 """
@@ -1114,7 +1117,15 @@ body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background: #e
 .ctrl-group { display: flex; align-items: center; gap: 8px; }
 .ctrl-group label, .ctrl-label { font-size: 0.85rem; font-weight: 600; color: #475569; white-space: nowrap; }
 #program-select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; min-width: 130px; }
-#stream-select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; min-width: 180px; max-width: 320px; }
+.ms-wrap { position: relative; }
+#stream-ms-toggle { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; min-width: 180px; max-width: 320px; background: #fff; cursor: pointer; color: #334155; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#stream-ms-toggle:hover { background: #f1f5f9; }
+.ms-panel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; box-shadow: 0 8px 24px rgba(15,23,42,0.15); padding: 6px; min-width: 220px; max-height: 320px; overflow-y: auto; }
+.ms-panel.hidden { display: none; }
+.ms-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; font-size: 0.85rem; color: #334155; cursor: pointer; white-space: nowrap; }
+.ms-item:hover { background: #f1f5f9; }
+.ms-item input { margin: 0; cursor: pointer; }
+.ms-item.ms-all { border-bottom: 1px solid #e2e8f0; margin-bottom: 4px; padding-bottom: 8px; font-weight: 600; }
 .btn-group { display: flex; gap: 4px; flex-wrap: wrap; }
 .btn-group button { padding: 6px 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; cursor: pointer; font-size: 0.85rem; color: #334155; }
 .btn-group button:hover { background: #f1f5f9; }
@@ -1161,7 +1172,7 @@ def _control_script(
   var US_TO_90K = {US_TO_90K};
   var K90_TO_US = {K90_TO_US};
   var currentProgram = {default_program};
-  var currentStream = 'all';
+  var currentStreams = [];
   var currentFilter = 'all';
   var currentLayout = 'combined';
   var currentUnit = {json.dumps(initial_unit)};
@@ -1197,20 +1208,15 @@ def _control_script(
   }}
 
   function matchesStream(m) {{
-    if (currentStream === 'all') return true;
-    var si = parseInt(currentStream, 10);
+    if (!currentStreams.length) return true;
     if (m.stream_index === undefined || m.stream_index === null) return false;
-    return m.stream_index === si;
+    return currentStreams.indexOf(m.stream_index) >= 0;
   }}
 
   function computeVisibilitySeparate(meta) {{
     return meta.map(function(m) {{
-      if (currentStream !== 'all') {{
-        if (m.kind === 'av' || m.kind === 'pcr_interval' || m.kind === 'pcr') return false;
-        return matchesStream(m);
-      }}
       if (m.kind === 'av' || m.kind === 'pcr_interval' || m.kind === 'pcr') return true;
-      return true;
+      return matchesStream(m);
     }});
   }}
 
@@ -1219,7 +1225,8 @@ def _control_script(
     return meta.map(function(m) {{
       if (m.kind === 'av' || m.kind === 'pcr_interval') return m.program === currentProgram;
       if (m.program !== currentProgram) return false;
-      if (currentStream !== 'all' && !matchesStream(m)) return false;
+      if (m.stream_index === undefined || m.stream_index === null) return kinds.indexOf(m.kind) >= 0;
+      if (currentStreams.length && currentStreams.indexOf(m.stream_index) < 0) return false;
       return kinds.indexOf(m.kind) >= 0;
     }});
   }}
@@ -1229,22 +1236,41 @@ def _control_script(
     return computeVisibilityCombined(meta);
   }}
 
-  function updateStreamSelect() {{
-    var sel = document.getElementById('stream-select');
-    if (!sel) return;
+  function streamSelectionLabel() {{
+    if (!currentStreams.length) return '全部 Stream';
     var prog = PROGRAMS[currentProgram];
-    var html = '<option value="all">全部 Stream</option>';
+    var names = [];
+    (prog && prog.streams ? prog.streams : []).forEach(function(s) {{
+      if (currentStreams.indexOf(s.index) >= 0) names.push(s.kind + ' #' + s.index);
+    }});
+    if (!names.length) names = currentStreams.map(function(i) {{ return '#' + i; }});
+    return names.join(', ');
+  }}
+
+  function syncStreamToggle() {{
+    var btn = document.getElementById('stream-ms-toggle');
+    if (btn) btn.textContent = streamSelectionLabel();
+    var allCb = document.getElementById('stream-ms-all');
+    if (allCb) allCb.checked = !currentStreams.length;
+    var panel = document.getElementById('stream-ms-panel');
+    if (!panel) return;
+    panel.querySelectorAll('input[data-stream-index]').forEach(function(cb) {{
+      cb.checked = currentStreams.indexOf(parseInt(cb.getAttribute('data-stream-index'), 10)) >= 0;
+    }});
+  }}
+
+  function updateStreamSelect() {{
+    var panel = document.getElementById('stream-ms-panel');
+    if (!panel) return;
+    var prog = PROGRAMS[currentProgram];
+    var html = '<label class="ms-item ms-all"><input type="checkbox" id="stream-ms-all"> 全部 Stream</label>';
     if (prog && prog.streams) {{
       prog.streams.forEach(function(s) {{
-        html += '<option value="' + s.index + '">' + s.label + '</option>';
+        html += '<label class="ms-item"><input type="checkbox" data-stream-index="' + s.index + '"> ' + s.label + '</label>';
       }});
     }}
-    sel.innerHTML = html;
-    sel.value = currentStream;
-    if (sel.selectedIndex < 0) {{
-      currentStream = 'all';
-      sel.value = 'all';
-    }}
+    panel.innerHTML = html;
+    syncStreamToggle();
   }}
 
   function updateSeparateAxisVisibility(gd, meta, visible) {{
@@ -1666,7 +1692,7 @@ def _control_script(
     updateStreamSelect();
     document.getElementById('program-select').addEventListener('change', function(e) {{
       currentProgram = parseInt(e.target.value, 10);
-      currentStream = 'all';
+      currentStreams = [];
       updateStreamSelect();
       separatePlotBuilt = false;
       separatePlotProgram = -1;
@@ -1676,10 +1702,37 @@ def _control_script(
         applyVisibility();
       }}
     }});
-    document.getElementById('stream-select').addEventListener('change', function(e) {{
-      currentStream = e.target.value;
-      applyVisibility();
-    }});
+    var msToggle = document.getElementById('stream-ms-toggle');
+    var msPanel = document.getElementById('stream-ms-panel');
+    var msWrap = document.getElementById('stream-multiselect');
+    if (msToggle && msPanel) {{
+      msToggle.addEventListener('click', function(e) {{
+        e.stopPropagation();
+        msPanel.classList.toggle('hidden');
+      }});
+      document.addEventListener('click', function(e) {{
+        if (msWrap && !msWrap.contains(e.target)) msPanel.classList.add('hidden');
+      }});
+      msPanel.addEventListener('change', function(e) {{
+        var t = e.target;
+        if (t.id === 'stream-ms-all') {{
+          currentStreams = [];
+          syncStreamToggle();
+          applyVisibility();
+          return;
+        }}
+        var idx = parseInt(t.getAttribute('data-stream-index'), 10);
+        if (isNaN(idx)) return;
+        var pos = currentStreams.indexOf(idx);
+        if (t.checked && pos < 0) currentStreams.push(idx);
+        if (!t.checked && pos >= 0) currentStreams.splice(pos, 1);
+        var prog = PROGRAMS[currentProgram];
+        if (prog && prog.streams && currentStreams.length === prog.streams.length) currentStreams = [];
+        currentStreams.sort(function(a, b) {{ return a - b; }});
+        syncStreamToggle();
+        applyVisibility();
+      }});
+    }}
     document.querySelectorAll('#unit-mode button').forEach(function(btn) {{
       btn.addEventListener('click', function() {{
         document.querySelectorAll('#unit-mode button').forEach(function(b) {{ b.classList.remove('active'); }});
