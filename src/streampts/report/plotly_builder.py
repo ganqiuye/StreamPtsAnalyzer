@@ -27,6 +27,15 @@ from streampts.utils.units import (
 )
 
 from streampts.utils.downsample import lttb_downsample
+from streampts.utils.timeline import (
+    SEGMENT_GAP_S,
+    TIMELINE_RESET_THRESHOLD_S,
+    continuous_time_lookup,
+    continuous_times_for_pcr,
+    continuous_times_for_points,
+    has_timeline_resets,
+    ordered_pts_times,
+)
 
 PTS_Y_TICKFORMAT = ",d"
 US_TO_90K = 90000.0 / 1_000_000.0
@@ -35,6 +44,17 @@ DISPLAY_MAX_POINTS = 2500
 PTS_HOVER_TEMPLATE = (
     "%{customdata[0]}<br>"
     "Time: %{customdata[1]}<br>"
+    "PTS: %{customdata[2]} (90k) | %{customdata[3]} (µs)<br>"
+    "DTS: %{customdata[4]}<br>"
+    "Packet #%{customdata[5]}<br>"
+    "Flags: %{customdata[6]}"
+    "<extra></extra>"
+)
+
+PTS_HOVER_SEGMENTED_TEMPLATE = (
+    "%{customdata[0]}<br>"
+    "Timeline: %{customdata[1]}<br>"
+    "PTS Time: %{customdata[7]}<br>"
     "PTS: %{customdata[2]} (90k) | %{customdata[3]} (µs)<br>"
     "DTS: %{customdata[4]}<br>"
     "Packet #%{customdata[5]}<br>"
@@ -118,12 +138,21 @@ def _meta_has_negative_pts(meta: list[dict]) -> bool:
     return False
 
 
-def _display_points(points: list[SeriesPoint], max_pts: int) -> list[SeriesPoint]:
+def _pts_y_value(pts: int, pts_time: float, unit: UnitName) -> float:
+    if unit == "us":
+        return float(pts_us_from_time(pts_time))
+    return float(pts)
+
+
+def _display_points(
+    points: list[SeriesPoint], max_pts: int
+) -> tuple[list[SeriesPoint], list[float]]:
+    timeline_x = continuous_times_for_points(points)
     if len(points) <= max_pts:
-        return points
+        return points, timeline_x
     import numpy as np
 
-    x = np.array([p.pts_time for p in points], dtype=float)
+    x = np.array(timeline_x, dtype=float)
     y = np.array([float(p.pts) for p in points], dtype=float)
     sx, _ = lttb_downsample(x, y, max_pts)
     picked: list[int] = []
@@ -133,22 +162,67 @@ def _display_points(points: list[SeriesPoint], max_pts: int) -> list[SeriesPoint
         if idx not in seen:
             seen.add(idx)
             picked.append(idx)
-    return [points[i] for i in sorted(picked)]
+    picked.sort()
+    return [points[i] for i in picked], [timeline_x[i] for i in picked]
 
 
-def _pts_customdata(points: list[SeriesPoint], streams: list[StreamInfo]) -> list[list]:
-    return [
-        [
-            _stream_label(streams, p.stream_index or -1),
-            format_time(p.pts_time),
-            str(p.pts),
-            str(pts_us_from_time(p.pts_time)),
-            str(p.dts if p.dts is not None else "N/A"),
-            str(p.packet_index),
-            p.flags or "—",
-        ]
-        for p in points
-    ]
+def _analysis_uses_timeline(analysis: AnalysisResult) -> bool:
+    for ps in analysis.program_series:
+        for pts in list(ps.video_streams.values()) + list(ps.audio_streams.values()):
+            if has_timeline_resets(ordered_pts_times(pts)):
+                return True
+        if ps.pcr_points:
+            pcr_times = [p.pcr_time for p in sorted(ps.pcr_points, key=lambda p: p.packet_index)]
+            if has_timeline_resets(pcr_times):
+                return True
+    return False
+
+
+def _program_uses_timeline(ps: ProgramSeries) -> bool:
+    for pts in list(ps.video_streams.values()) + list(ps.audio_streams.values()):
+        if has_timeline_resets(ordered_pts_times(pts)):
+            return True
+    if ps.pcr_points:
+        pcr_times = [p.pcr_time for p in sorted(ps.pcr_points, key=lambda p: p.packet_index)]
+        if has_timeline_resets(pcr_times):
+            return True
+    return False
+
+
+def _xaxis_title(analysis: AnalysisResult) -> str:
+    return "Timeline (s)" if _analysis_uses_timeline(analysis) else "Time (s)"
+
+
+def _chart_x_values(points: list[SeriesPoint], timeline_x: list[float]) -> list[float]:
+    if has_timeline_resets(ordered_pts_times(points)):
+        return timeline_x
+    return [p.pts_time for p in points]
+
+
+def _pts_customdata(
+    points: list[SeriesPoint],
+    streams: list[StreamInfo],
+    *,
+    timeline_x: list[float] | None = None,
+    segmented: bool = False,
+) -> list[list]:
+    rows: list[list] = []
+    for i, p in enumerate(points):
+        raw_time = format_time(p.pts_time)
+        timeline = format_time(timeline_x[i]) if timeline_x else raw_time
+        rows.append(
+            [
+                _stream_label(streams, p.stream_index or -1),
+                timeline,
+                str(p.pts),
+                str(pts_us_from_time(p.pts_time)),
+                str(p.dts if p.dts is not None else "N/A"),
+                str(p.packet_index),
+                p.flags or "—",
+                raw_time if segmented else "",
+            ]
+        )
+    return rows
 
 
 def _y_from_pairs(pairs: list[list], unit: UnitName) -> list[float]:
@@ -299,9 +373,16 @@ class _FigureBuilder:
         stream_kind: str,
         stream_index: int,
         default_unit: UnitName = "us",
+        *,
+        time_lookup: dict[int, float] | None = None,
     ) -> None:
         if not events:
             return
+
+        def _x_time(packet_index: int, pts_time: float) -> float:
+            if time_lookup and packet_index in time_lookup:
+                return time_lookup[packet_index]
+            return pts_time
 
         color = LINE_COLORS[stream_kind]
         label = f"{'Video' if stream_kind == 'video' else 'Audio'} 跳变"
@@ -312,26 +393,20 @@ class _FigureBuilder:
         for e in events:
             if e.prev_packet_index < 0:
                 continue
+            prev_x = _x_time(e.prev_packet_index, e.prev_pts_time)
+            curr_x = _x_time(e.packet_index, e.pts_time)
+            if curr_x <= prev_x:
+                curr_x = prev_x + SEGMENT_GAP_S
+            prev_y = _pts_y_value(e.prev_pts, e.prev_pts_time, default_unit)
+            curr_y = _pts_y_value(e.pts, e.pts_time, default_unit)
+            # jump_meta: [prev_pts_time, prev_pts, curr_pts_time, curr_pts] for JS unit switch
             jump_meta.append([e.prev_pts_time, e.prev_pts, e.pts_time, e.pts])
-            bx.extend([e.prev_pts_time, e.pts_time])
-            by0.extend(
-                [
-                    float(pts_us_from_time(e.prev_pts_time))
-                    if default_unit == "us"
-                    else float(e.prev_pts),
-                    float(pts_us_from_time(e.pts_time))
-                    if default_unit == "us"
-                    else float(e.pts),
-                ]
-            )
+            bx.extend([prev_x, curr_x])
+            by0.extend([prev_y, curr_y])
             marker_text.extend(
                 [
-                    str(pts_us_from_time(e.prev_pts_time))
-                    if default_unit == "us"
-                    else str(e.prev_pts),
-                    str(pts_us_from_time(e.pts_time))
-                    if default_unit == "us"
-                    else str(e.pts),
+                    str(int(prev_y)) if default_unit == "us" else str(e.prev_pts),
+                    str(int(curr_y)) if default_unit == "us" else str(e.pts),
                 ]
             )
             bhover.extend(
@@ -352,28 +427,19 @@ class _FigureBuilder:
                     ),
                 ]
             )
-            lx.extend([e.prev_pts_time, e.pts_time, None])
-            ly0.extend(
-                [
-                    float(pts_us_from_time(e.prev_pts_time))
-                    if default_unit == "us"
-                    else float(e.prev_pts),
-                    float(pts_us_from_time(e.pts_time))
-                    if default_unit == "us"
-                    else float(e.pts),
-                    None,
-                ]
-            )
+            lx.extend([prev_x, curr_x, None])
+            ly0.extend([prev_y, curr_y, None])
 
         self._add(
-            go.Scatter(
+            go.Scattergl(
                 name=f"{label} 连线",
                 x=lx,
                 y=ly0,
                 mode="lines",
-                line=dict(width=1.5, color="#f97316", dash="dash"),
+                line=dict(width=2, color="#f97316", dash="dash"),
                 hoverinfo="skip",
                 showlegend=True,
+                connectgaps=False,
             ),
             row=row,
             program=program,
@@ -429,29 +495,45 @@ def _add_program_traces(
     has_pcr_interval: bool = False,
 ) -> None:
     prog_label = f"Program {ps.program_id}" if ps.program_id is not None else "All streams"
+    program_segmented = False
 
     for vidx, vpts in ps.video_streams.items():
         if layout == "combined":
             row = rows_map["combined"]
         else:
             row = _separate_row_for(separate_plan or [], "video", vidx)
-        display = _display_points(vpts, DISPLAY_MAX_POINTS)
+        display, timeline_x = _display_points(vpts, DISPLAY_MAX_POINTS)
+        segmented = has_timeline_resets(ordered_pts_times(vpts))
+        program_segmented = program_segmented or segmented
+        chart_x = _chart_x_values(display, timeline_x)
+        time_lookup = continuous_time_lookup(vpts) if segmented else None
+        hover_tpl = PTS_HOVER_SEGMENTED_TEMPLATE if segmented else PTS_HOVER_TEMPLATE
         builder.add_pts(
             f"{prog_label} Video #{vidx}",
-            [p.pts_time for p in display],
+            chart_x,
             [[p.pts_time, p.pts] for p in display],
             row,
             prog_idx,
             "video",
             LINE_COLORS["video"],
             stream_index=vidx,
-            customdata=_pts_customdata(display, streams),
+            customdata=_pts_customdata(
+                display, streams, timeline_x=timeline_x, segmented=segmented
+            ),
+            hover_template=hover_tpl,
             default_unit=default_unit,
         )
         ev = diag.stream_diagnostics.get(vidx)
         if ev and ev.jumps:
             builder.add_jump_boundaries(
-                ev.jumps, streams, row, prog_idx, "video", vidx, default_unit
+                ev.jumps,
+                streams,
+                row,
+                prog_idx,
+                "video",
+                vidx,
+                default_unit,
+                time_lookup=time_lookup,
             )
 
     for aidx, apts in ps.audio_streams.items():
@@ -459,23 +541,38 @@ def _add_program_traces(
             row = rows_map["combined"]
         else:
             row = _separate_row_for(separate_plan or [], "audio", aidx)
-        display = _display_points(apts, DISPLAY_MAX_POINTS)
+        display, timeline_x = _display_points(apts, DISPLAY_MAX_POINTS)
+        segmented = has_timeline_resets(ordered_pts_times(apts))
+        program_segmented = program_segmented or segmented
+        chart_x = _chart_x_values(display, timeline_x)
+        time_lookup = continuous_time_lookup(apts) if segmented else None
+        hover_tpl = PTS_HOVER_SEGMENTED_TEMPLATE if segmented else PTS_HOVER_TEMPLATE
         builder.add_pts(
             f"{prog_label} Audio #{aidx}",
-            [p.pts_time for p in display],
+            chart_x,
             [[p.pts_time, p.pts] for p in display],
             row,
             prog_idx,
             "audio",
             LINE_COLORS["audio"],
             stream_index=aidx,
-            customdata=_pts_customdata(display, streams),
+            customdata=_pts_customdata(
+                display, streams, timeline_x=timeline_x, segmented=segmented
+            ),
+            hover_template=hover_tpl,
             default_unit=default_unit,
         )
         ev = diag.stream_diagnostics.get(aidx)
         if ev and ev.jumps:
             builder.add_jump_boundaries(
-                ev.jumps, streams, row, prog_idx, "audio", aidx, default_unit
+                ev.jumps,
+                streams,
+                row,
+                prog_idx,
+                "audio",
+                aidx,
+                default_unit,
+                time_lookup=time_lookup,
             )
 
     if has_pcr_data and ps.pcr_points:
@@ -485,18 +582,28 @@ def _add_program_traces(
         else:
             row = _separate_row_for(separate_plan or [], "pcr", None)
             secondary_y = False
-        pcr_display = ps.pcr_points[:DISPLAY_MAX_POINTS]
-        if len(ps.pcr_points) > DISPLAY_MAX_POINTS:
-            step = len(ps.pcr_points) / DISPLAY_MAX_POINTS
-            pcr_display = [
-                ps.pcr_points[int(i * step)] for i in range(DISPLAY_MAX_POINTS)
-            ]
+        pcr_all = ps.pcr_points
+        pcr_timeline = continuous_times_for_pcr(pcr_all)
+        pcr_segmented = has_timeline_resets(
+            [p.pcr_time for p in sorted(pcr_all, key=lambda p: p.packet_index)]
+        )
+        program_segmented = program_segmented or pcr_segmented
+        if len(pcr_all) > DISPLAY_MAX_POINTS:
+            step = len(pcr_all) / DISPLAY_MAX_POINTS
+            indices = [int(i * step) for i in range(DISPLAY_MAX_POINTS)]
+            pcr_display = [pcr_all[i] for i in indices]
+            pcr_x = [pcr_timeline[i] for i in indices]
+        else:
+            pcr_display = pcr_all
+            pcr_x = pcr_timeline
+        if not pcr_segmented:
+            pcr_x = [p.pcr_time for p in pcr_display]
         pairs = [
             [p.pcr_time, p.pcr or int(p.pcr_time * 90000)] for p in pcr_display
         ]
         builder.add_pts(
             f"{prog_label} PCR",
-            [p.pcr_time for p in pcr_display],
+            pcr_x,
             pairs,
             row,
             prog_idx,
@@ -506,15 +613,19 @@ def _add_program_traces(
             customdata=[
                 [
                     "PCR",
-                    format_time(p.pcr_time),
+                    format_time(pcr_x[i]),
                     str(p.pcr),
                     str(pts_us_from_time(p.pcr_time)),
                     "N/A",
                     str(p.packet_index),
                     "—",
+                    format_time(p.pcr_time) if pcr_segmented else "",
                 ]
-                for p in pcr_display
+                for i, p in enumerate(pcr_display)
             ],
+            hover_template=(
+                PTS_HOVER_SEGMENTED_TEMPLATE if pcr_segmented else PTS_HOVER_TEMPLATE
+            ),
             secondary_y=secondary_y,
             default_unit=default_unit,
         )
@@ -524,14 +635,24 @@ def _add_program_traces(
             row = rows_map["av"]
         else:
             row = _separate_row_for(separate_plan or [], "av", None)
+        av_x = [p.timeline_time for p in diag.av_sync]
         builder.add_interval_line(
             f"{prog_label} A-V Delta",
-            [p.time for p in diag.av_sync],
+            av_x,
             [p.delta_ms for p in diag.av_sync],
             [
-                f"A-V Delta: {p.delta_ms:.3f} ms<br>"
-                f"Time: {format_time(p.time)}<br>"
-                f"Video PTS: {p.video_pts}<br>Audio PTS: {p.audio_pts}"
+                (
+                    f"A-V Delta: {p.delta_ms:.3f} ms<br>"
+                    f"Timeline: {format_time(p.timeline_time)}<br>"
+                    f"PTS Time: {format_time(p.time)}<br>"
+                    f"Video PTS: {p.video_pts}<br>Audio PTS: {p.audio_pts}"
+                    if program_segmented
+                    else (
+                        f"A-V Delta: {p.delta_ms:.3f} ms<br>"
+                        f"Time: {format_time(p.time)}<br>"
+                        f"Video PTS: {p.video_pts}<br>Audio PTS: {p.audio_pts}"
+                    )
+                )
                 for p in diag.av_sync
             ],
             row,
@@ -545,14 +666,22 @@ def _add_program_traces(
             row = rows_map["pcr_interval"]
         else:
             row = _separate_row_for(separate_plan or [], "pcr_interval", None)
+        pcr_iv_x = [p.timeline_time for p in diag.pcr_intervals]
         builder.add_interval_line(
             f"{prog_label} PCR Interval",
-            [p.time for p in diag.pcr_intervals],
+            pcr_iv_x,
             [p.interval_ms for p in diag.pcr_intervals],
             [
                 f"Interval: {p.interval_ms:.3f} ms<br>"
                 f"Jitter: {p.jitter_ms:+.3f} ms<br>"
-                f"Time: {format_time(p.time)}"
+                f"Timeline: {format_time(p.timeline_time)}<br>"
+                f"PTS Time: {format_time(p.time)}"
+                if program_segmented
+                else (
+                    f"Interval: {p.interval_ms:.3f} ms<br>"
+                    f"Jitter: {p.jitter_ms:+.3f} ms<br>"
+                    f"Time: {format_time(p.time)}"
+                )
                 for p in diag.pcr_intervals
             ],
             row,
@@ -657,7 +786,7 @@ def build_figure(
         fig.update_xaxes(showgrid=True, gridcolor="#e2e8f0", row=r, col=1)
         fig.update_yaxes(showgrid=True, gridcolor="#e2e8f0", row=r, col=1)
 
-    fig.update_xaxes(title_text="Time (s)", row=nrows, col=1)
+    fig.update_xaxes(title_text=_xaxis_title(analysis), row=nrows, col=1)
     fig.update_yaxes(
         title_text=f"Video(蓝) / Audio(红) — {unit}",
         row=1,
@@ -753,7 +882,8 @@ def build_separate_figure_for_program(
         elif p.kind in ("av", "pcr_interval"):
             fig.update_yaxes(title_text="ms", row=p.row, col=1)
 
-    fig.update_xaxes(title_text="Time (s)", row=nrows, col=1)
+    x_title = "Timeline (s)" if _program_uses_timeline(ps) else "Time (s)"
+    fig.update_xaxes(title_text=x_title, row=nrows, col=1)
     return fig, builder.meta, has_negative_pts, height
 
 
@@ -927,7 +1057,7 @@ def build_summary_html(
   </div>
   {notes}
   <div class="help">
-    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / Stream · 分开布局按 Stream 分行 · 滚轮缩放 · 左/右键平移
+    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / Stream · 分开布局按 Stream 分行 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
   </div>
 </header>
 """

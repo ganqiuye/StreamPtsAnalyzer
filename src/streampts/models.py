@@ -88,6 +88,7 @@ class AvSyncPoint:
     video_pts: int
     audio_pts: int
     delta_ms: float
+    timeline_time: float = 0.0
 
 
 @dataclass
@@ -105,6 +106,7 @@ class PcrIntervalPoint:
     interval_ms: float
     jitter_ms: float
     is_anomaly: bool
+    timeline_time: float = 0.0
 
 
 @dataclass

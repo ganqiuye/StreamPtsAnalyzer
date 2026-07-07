@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from streampts.analyze_service import AnalyzeError, AnalyzeOptions, apply_options_to_config, open_report_path
+from streampts.analyze_service import AnalyzeError, AnalyzeOptions, apply_options_to_config, default_output, open_report_path
 from streampts.config import load_config
 from streampts.extractor.ffprobe import FfprobeError, resolve_ffprobe
 from streampts.gui.branding import asset_path, has_logo
@@ -335,6 +335,9 @@ class StreamPtsApp(ctk.CTk):
     def _set_input_path(self, path: Path) -> None:
         self._input_path = path.resolve()
         self._input_var.set(str(self._input_path))
+        suggested = default_output(self._input_path)
+        self._output_path = suggested
+        self._output_var.set(str(suggested))
         self._drop_label_tk.configure(
             text=f"已选择\n{self._input_path.name}",
             fg="#e0e0e0",

@@ -5,6 +5,7 @@ import statistics
 
 from streampts.config import AvSyncConfig
 from streampts.models import AvSyncPoint, AvSyncStats, SeriesPoint
+from streampts.utils.timeline import continuous_time_lookup, iter_series_segments
 
 
 def _nearest_audio(
@@ -34,6 +35,31 @@ def ms_delta_from_times(audio_time: float, video_time: float, audio_pts: int) ->
     return (audio_pts - video_pts_equiv) / 90.0
 
 
+def _sync_segment(
+    video: list[SeriesPoint],
+    audio: list[SeriesPoint],
+    timeline_lookup: dict[int, float],
+) -> list[AvSyncPoint]:
+    audio_sorted = sorted(audio, key=lambda p: p.pts_time)
+    audio_times = [p.pts_time for p in audio_sorted]
+    audio_pts = [p.pts for p in audio_sorted]
+
+    points: list[AvSyncPoint] = []
+    for vp in sorted(video, key=lambda p: p.packet_index):
+        a_pts, _ = _nearest_audio(vp.pts_time, audio_times, audio_pts)
+        timeline = timeline_lookup.get(vp.packet_index, vp.pts_time)
+        points.append(
+            AvSyncPoint(
+                time=vp.pts_time,
+                timeline_time=timeline,
+                video_pts=vp.pts,
+                audio_pts=a_pts,
+                delta_ms=(a_pts - vp.pts) / 90.0,
+            )
+        )
+    return points
+
+
 def compute_av_sync(
     video: list[SeriesPoint],
     audio: list[SeriesPoint],
@@ -42,29 +68,24 @@ def compute_av_sync(
     if not video or not audio:
         return [], None
 
-    audio_sorted = sorted(audio, key=lambda p: p.pts_time)
-    audio_times = [p.pts_time for p in audio_sorted]
-    audio_pts = [p.pts for p in audio_sorted]
+    timeline_lookup = continuous_time_lookup(video)
+    video_segments = iter_series_segments(video)
+    audio_segments = iter_series_segments(audio)
 
     points: list[AvSyncPoint] = []
-    for vp in sorted(video, key=lambda p: p.pts_time):
-        a_pts, _ = _nearest_audio(vp.pts_time, audio_times, audio_pts)
-        delta_ms = (a_pts - vp.pts) / 90.0
-        points.append(
-            AvSyncPoint(
-                time=vp.pts_time,
-                video_pts=vp.pts,
-                audio_pts=a_pts,
-                delta_ms=delta_ms,
-            )
-        )
+    for i, vseg in enumerate(video_segments):
+        aseg = audio_segments[i] if i < len(audio_segments) else audio_segments[-1]
+        points.extend(_sync_segment(vseg, aseg, timeline_lookup))
+
+    if not points:
+        return [], None
 
     deltas = [p.delta_ms for p in points]
-    stats = AvSyncStats(
-        mean_ms=float(statistics.mean(deltas)),
+    threshold = config.threshold_ms
+    return points, AvSyncStats(
+        mean_ms=statistics.mean(deltas),
         max_ms=max(deltas),
         min_ms=min(deltas),
-        std_ms=float(statistics.pstdev(deltas)) if len(deltas) > 1 else 0.0,
-        exceed_count=sum(1 for d in deltas if abs(d) > config.threshold_ms),
+        std_ms=statistics.pstdev(deltas) if len(deltas) > 1 else 0.0,
+        exceed_count=sum(1 for d in deltas if abs(d) > threshold),
     )
-    return points, stats

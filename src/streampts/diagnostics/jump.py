@@ -10,6 +10,7 @@ from streampts.models import (
     SeriesPoint,
     StreamDiagnostics,
 )
+from streampts.utils.timeline import iter_series_segments
 from streampts.utils.units import ms_from_pts_delta
 
 
@@ -20,13 +21,35 @@ def _median_positive(deltas: list[int]) -> float:
     return float(statistics.median(pos))
 
 
-def detect_jumps(
+def _segment_boundary_event(
+    stream_index: int,
+    prev_pt: SeriesPoint,
+    curr: SeriesPoint,
+) -> DiscontinuityEvent:
+    delta = curr.pts - prev_pt.pts
+    return DiscontinuityEvent(
+        stream_index=stream_index,
+        packet_index=curr.packet_index,
+        pts=curr.pts,
+        pts_time=curr.pts_time,
+        jump_type=JumpType.DISCONTINUITY,
+        severity=JumpSeverity.SEVERE,
+        delta_pts=delta,
+        delta_ms=ms_from_pts_delta(delta),
+        flags=curr.flags,
+        prev_pts=prev_pt.pts,
+        prev_pts_time=prev_pt.pts_time,
+        prev_packet_index=prev_pt.packet_index,
+    )
+
+
+def _detect_jumps_in_segment(
     stream_index: int,
     points: list[SeriesPoint],
     config: JumpConfig,
-) -> StreamDiagnostics:
-    if not points:
-        return StreamDiagnostics(stream_index=stream_index, packet_count=0)
+) -> list[DiscontinuityEvent]:
+    if len(points) < 2:
+        return []
 
     sorted_pts = sorted(points, key=lambda p: (p.pts_time, p.packet_index))
     deltas = [
@@ -114,9 +137,37 @@ def detect_jumps(
             )
         )
 
+    return events
+
+
+def detect_jumps(
+    stream_index: int,
+    points: list[SeriesPoint],
+    config: JumpConfig,
+) -> StreamDiagnostics:
+    if not points:
+        return StreamDiagnostics(stream_index=stream_index, packet_count=0)
+
+    segments = iter_series_segments(points)
+    events: list[DiscontinuityEvent] = []
+
+    if len(segments) > 1:
+        for i in range(1, len(segments)):
+            prev_seg = sorted(segments[i - 1], key=lambda p: p.packet_index)
+            curr_seg = sorted(segments[i], key=lambda p: p.packet_index)
+            prev_pt = max(prev_seg, key=lambda p: (p.pts_time, p.packet_index))
+            curr_pt = min(curr_seg, key=lambda p: (p.pts_time, p.packet_index))
+            events.append(
+                _segment_boundary_event(stream_index, prev_pt, curr_pt)
+            )
+    else:
+        for seg in segments:
+            events.extend(_detect_jumps_in_segment(stream_index, seg, config))
+
+    events.sort(key=lambda e: e.packet_index)
     return StreamDiagnostics(
         stream_index=stream_index,
-        packet_count=len(sorted_pts),
+        packet_count=len(points),
         jumps=events,
     )
 
