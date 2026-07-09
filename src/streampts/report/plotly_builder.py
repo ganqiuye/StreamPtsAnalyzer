@@ -22,11 +22,12 @@ from streampts.models import (
 )
 from streampts.utils.units import (
     format_time,
+    pcr_unit_label,
     pts_us_from_time,
     unit_label,
 )
 
-from streampts.utils.downsample import lttb_downsample
+from streampts.utils.segment_downsample import downsample_pcr_points, downsample_series_points
 from streampts.utils.timeline import (
     SEGMENT_GAP_S,
     TIMELINE_RESET_THRESHOLD_S,
@@ -59,6 +60,27 @@ PTS_HOVER_SEGMENTED_TEMPLATE = (
     "DTS: %{customdata[4]}<br>"
     "Packet #%{customdata[5]}<br>"
     "Flags: %{customdata[6]}"
+    "<extra></extra>"
+)
+
+PCR_HOVER_TEMPLATE = (
+    "%{customdata[0]}<br>"
+    "Time: %{customdata[1]}<br>"
+    "PCR Base: %{customdata[2]} (90k) | Ext: %{customdata[3]}<br>"
+    "PCR Full: %{customdata[4]} (27M)<br>"
+    "PCR Time: %{customdata[5]} | %{customdata[6]} (µs)<br>"
+    "Packet #%{customdata[7]}"
+    "<extra></extra>"
+)
+
+PCR_HOVER_SEGMENTED_TEMPLATE = (
+    "%{customdata[0]}<br>"
+    "Timeline: %{customdata[1]}<br>"
+    "PCR Time (raw): %{customdata[8]}<br>"
+    "PCR Base: %{customdata[2]} (90k) | Ext: %{customdata[3]}<br>"
+    "PCR Full: %{customdata[4]} (27M)<br>"
+    "PCR Time: %{customdata[5]} | %{customdata[6]} (µs)<br>"
+    "Packet #%{customdata[7]}"
     "<extra></extra>"
 )
 
@@ -150,20 +172,11 @@ def _display_points(
     timeline_x = continuous_times_for_points(points)
     if len(points) <= max_pts:
         return points, timeline_x
-    import numpy as np
-
-    x = np.array(timeline_x, dtype=float)
-    y = np.array([float(p.pts) for p in points], dtype=float)
-    sx, _ = lttb_downsample(x, y, max_pts)
-    picked: list[int] = []
-    seen: set[int] = set()
-    for tx in sx:
-        idx = int(np.argmin(np.abs(x - tx)))
-        if idx not in seen:
-            seen.add(idx)
-            picked.append(idx)
-    picked.sort()
-    return [points[i] for i in picked], [timeline_x[i] for i in picked]
+    display = downsample_series_points(points, max_pts)
+    display_packets = {p.packet_index for p in display}
+    timeline_lookup = dict(zip([p.packet_index for p in points], timeline_x))
+    display_timeline = [timeline_lookup[p.packet_index] for p in display]
+    return display, display_timeline
 
 
 def _analysis_uses_timeline(analysis: AnalysisResult) -> bool:
@@ -229,6 +242,34 @@ def _y_from_pairs(pairs: list[list], unit: UnitName) -> list[float]:
     if unit == "us":
         return [float(pts_us_from_time(t)) for t, _ in pairs]
     return [float(pts) for _, pts in pairs]
+
+
+def _pcr_pairs(points: list[PcrPoint]) -> list[list]:
+    return [[p.pcr_time, p.base_90k] for p in points]
+
+
+def _pcr_customdata(
+    points: list[PcrPoint],
+    timeline_x: list[float],
+    *,
+    segmented: bool,
+) -> list[list]:
+    rows: list[list] = []
+    for i, p in enumerate(points):
+        row = [
+            "PCR",
+            format_time(timeline_x[i]),
+            str(p.base_90k),
+            str(p.ext),
+            str(p.full_27m),
+            format_time(p.pcr_time),
+            str(pts_us_from_time(p.pcr_time)),
+            str(p.packet_index),
+        ]
+        if segmented:
+            row.append(format_time(p.pcr_time))
+        rows.append(row)
+    return rows
 
 
 def _pts_yaxis_kwargs(has_negative_pts: bool) -> dict:
@@ -578,55 +619,40 @@ def _add_program_traces(
     if has_pcr_data and ps.pcr_points:
         if layout == "combined":
             row = rows_map["combined"]
-            secondary_y = True
         else:
             row = _separate_row_for(separate_plan or [], "pcr", None)
-            secondary_y = False
         pcr_all = ps.pcr_points
         pcr_timeline = continuous_times_for_pcr(pcr_all)
         pcr_segmented = has_timeline_resets(
             [p.pcr_time for p in sorted(pcr_all, key=lambda p: p.packet_index)]
         )
         program_segmented = program_segmented or pcr_segmented
-        if len(pcr_all) > DISPLAY_MAX_POINTS:
-            step = len(pcr_all) / DISPLAY_MAX_POINTS
-            indices = [int(i * step) for i in range(DISPLAY_MAX_POINTS)]
-            pcr_display = [pcr_all[i] for i in indices]
-            pcr_x = [pcr_timeline[i] for i in indices]
-        else:
-            pcr_display = pcr_all
-            pcr_x = pcr_timeline
+        pcr_display = downsample_pcr_points(pcr_all, DISPLAY_MAX_POINTS)
+        pcr_lookup = {
+            p.packet_index: t for p, t in zip(pcr_all, pcr_timeline)
+        }
+        pcr_x = [pcr_lookup[p.packet_index] for p in pcr_display]
         if not pcr_segmented:
             pcr_x = [p.pcr_time for p in pcr_display]
-        pairs = [
-            [p.pcr_time, p.pcr or int(p.pcr_time * 90000)] for p in pcr_display
-        ]
+        pcr_pairs = _pcr_pairs(pcr_display)
         builder.add_pts(
             f"{prog_label} PCR",
             pcr_x,
-            pairs,
+            pcr_pairs,
             row,
             prog_idx,
             "pcr",
             LINE_COLORS["pcr"],
             stream_index=None,
-            customdata=[
-                [
-                    "PCR",
-                    format_time(pcr_x[i]),
-                    str(p.pcr),
-                    str(pts_us_from_time(p.pcr_time)),
-                    "N/A",
-                    str(p.packet_index),
-                    "—",
-                    format_time(p.pcr_time) if pcr_segmented else "",
-                ]
-                for i, p in enumerate(pcr_display)
-            ],
-            hover_template=(
-                PTS_HOVER_SEGMENTED_TEMPLATE if pcr_segmented else PTS_HOVER_TEMPLATE
+            customdata=_pcr_customdata(
+                pcr_display,
+                pcr_x,
+                segmented=pcr_segmented,
             ),
-            secondary_y=secondary_y,
+            hover_template=(
+                PCR_HOVER_SEGMENTED_TEMPLATE if pcr_segmented else PCR_HOVER_TEMPLATE
+            ),
+            secondary_y=False,
             default_unit=default_unit,
         )
 
@@ -712,8 +738,7 @@ def build_figure(
     else:
         titles = [pts_title, "A-V Delta (ms)"]
         heights = [0.62, 0.38]
-    specs: list[dict] = [{"secondary_y": True}] if has_pcr_data else [{}]
-    specs.extend({} for _ in range(len(titles) - 1))
+    specs: list[dict] = [{} for _ in range(len(titles))]
     rows_map: dict[str, int] = {
         "combined": 1,
         "av": 2,
@@ -782,27 +807,22 @@ def build_figure(
 
     nrows = len(titles)
     unit = unit_label(default_unit)
+    pts_y_title = (
+        f"Video(蓝) / Audio(红) / PCR(绿) — {unit}"
+        if has_pcr_data
+        else f"Video(蓝) / Audio(红) — {unit}"
+    )
     for r in range(1, nrows + 1):
         fig.update_xaxes(showgrid=True, gridcolor="#e2e8f0", row=r, col=1)
         fig.update_yaxes(showgrid=True, gridcolor="#e2e8f0", row=r, col=1)
 
     fig.update_xaxes(title_text=_xaxis_title(analysis), row=nrows, col=1)
     fig.update_yaxes(
-        title_text=f"Video(蓝) / Audio(红) — {unit}",
+        title_text=pts_y_title,
         row=1,
         col=1,
-        secondary_y=False,
         **pts_y_kw,
     )
-    if has_pcr_data:
-        fig.update_yaxes(
-            title_text=f"PCR(绿) — {unit}",
-            row=1,
-            col=1,
-            secondary_y=True,
-            showgrid=False,
-            **pts_y_kw,
-        )
     fig.update_yaxes(title_text="ms", row=2, col=1)
     if has_pcr_interval:
         fig.update_yaxes(title_text="ms", row=3, col=1)
@@ -878,7 +898,12 @@ def build_separate_figure_for_program(
         if p.kind in ("video", "audio"):
             fig.update_yaxes(title_text=f"{unit}", row=p.row, col=1, **pts_y_kw)
         elif p.kind == "pcr":
-            fig.update_yaxes(title_text=f"PCR — {unit}", row=p.row, col=1, **pts_y_kw)
+            fig.update_yaxes(
+                title_text=pcr_unit_label(default_unit),
+                row=p.row,
+                col=1,
+                **pts_y_kw,
+            )
         elif p.kind in ("av", "pcr_interval"):
             fig.update_yaxes(title_text="ms", row=p.row, col=1)
 
@@ -1246,7 +1271,7 @@ def _control_script(
 
   function ptsAxisKeys(gd, meta, key) {{
     if (key === 'combined') {{
-      return HAS_PCR ? ['yaxis', 'yaxis2'] : ['yaxis'];
+      return ['yaxis'];
     }}
     var rows = {{}};
     meta.forEach(function(m) {{
@@ -1330,8 +1355,7 @@ def _control_script(
     var rel = {{}};
     if (key === 'combined') {{
       var ul = unitLabel(currentUnit);
-      rel['yaxis.title.text'] = 'Video(蓝) / Audio(红) — ' + ul;
-      if (HAS_PCR) rel['yaxis2.title.text'] = 'PCR(绿) — ' + ul;
+      rel['yaxis.title.text'] = (HAS_PCR ? 'Video(蓝) / Audio(红) / PCR(绿) — ' : 'Video(蓝) / Audio(红) — ') + ul;
     }}
 
     ptsAxisKeys(gd, meta, key).forEach(function(axKey) {{

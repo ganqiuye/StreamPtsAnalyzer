@@ -3,10 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-import numpy as np
-
 from streampts.config import AppConfig
 from streampts.extractor.ffprobe import run_ffprobe
+from streampts.extractor.ts_pcr import extract_pcr_by_pid
 from streampts.models import (
     AnalysisResult,
     PacketPoint,
@@ -16,7 +15,7 @@ from streampts.models import (
     SeriesPoint,
     StreamInfo,
 )
-from streampts.utils.downsample import lttb_downsample
+from streampts.utils.segment_downsample import downsample_pcr_points, downsample_series_points
 
 
 def _int_or_none(value: object) -> int | None:
@@ -56,7 +55,13 @@ def _parse_programs(raw: dict) -> list[ProgramInfo]:
                 indices.append(int(s["stream_index"]))
             elif "index" in s:
                 indices.append(int(s["index"]))
-        programs.append(ProgramInfo(program_id=int(p["program_id"]), stream_indices=indices))
+        programs.append(
+            ProgramInfo(
+                program_id=int(p["program_id"]),
+                stream_indices=indices,
+                pcr_pid=_int_or_none(p.get("pcr_pid")),
+            )
+        )
     return programs
 
 
@@ -113,23 +118,23 @@ def _to_series_point(pkt: PacketPoint) -> SeriesPoint | None:
 
 
 def _downsample_series(points: list[SeriesPoint], max_points: int) -> list[SeriesPoint]:
-    if len(points) <= max_points:
-        return points
-    x = np.array([p.pts_time for p in points])
-    y = np.array([float(p.pts) for p in points])
-    sx, sy = lttb_downsample(x, y, max_points)
-    idxs = set(int(np.argmin(np.abs(x - vx))) for vx in sx)
-    return [points[i] for i in sorted(idxs)]
+    return downsample_series_points(points, max_points)
 
 
 def _downsample_pcr(points: list[PcrPoint], max_points: int) -> list[PcrPoint]:
-    if len(points) <= max_points:
-        return points
-    x = np.array([p.pcr_time for p in points])
-    y = np.array([float(p.pcr or 0) for p in points])
-    sx, _ = lttb_downsample(x, y, max_points)
-    idxs = set(int(np.argmin(np.abs(x - vx))) for vx in sx)
-    return [points[i] for i in sorted(idxs)]
+    return downsample_pcr_points(points, max_points)
+
+
+def _pcr_for_program(
+    prog: ProgramInfo,
+    pcr_from_packets: list[PcrPoint],
+    pcr_by_pid: dict[int, list[PcrPoint]],
+) -> list[PcrPoint]:
+    if prog.pcr_pid is not None and prog.pcr_pid in pcr_by_pid:
+        return list(pcr_by_pid[prog.pcr_pid])
+    if pcr_from_packets:
+        return pcr_from_packets
+    return []
 
 
 def _build_program_series(
@@ -138,17 +143,20 @@ def _build_program_series(
     packets: list[PacketPoint],
     max_points: int,
     downsample: bool,
+    *,
+    pcr_by_pid: dict[int, list[PcrPoint]] | None = None,
 ) -> tuple[list[ProgramSeries], bool, dict[str, int]]:
     stream_type = {s.index: s.codec_type for s in streams}
-    pcr_all: list[PcrPoint] = []
+    pcr_from_packets: list[PcrPoint] = []
     for pkt in packets:
         if pkt.pcr_time is not None:
-            pcr_all.append(
+            pcr_from_packets.append(
                 PcrPoint(packet_index=pkt.packet_index, pcr=pkt.pcr, pcr_time=pkt.pcr_time)
             )
 
+    pcr_lookup = pcr_by_pid or {}
     original_counts = {
-        "pcr": len(pcr_all),
+        "pcr": sum(len(pcr_lookup[pid]) for pid in pcr_lookup) or len(pcr_from_packets),
         "video": 0,
         "audio": 0,
     }
@@ -183,7 +191,7 @@ def _build_program_series(
                 audio[idx] = _downsample_series(audio[idx], max_points)
                 any_downsampled = any_downsampled or len(audio[idx]) < before
 
-        pcr = pcr_all
+        pcr = _pcr_for_program(prog, pcr_from_packets, pcr_lookup)
         if downsample and len(pcr) > max_points:
             before = len(pcr)
             pcr = _downsample_pcr(pcr, max_points)
@@ -251,9 +259,14 @@ def extract_analysis(
     notify("正在解析包数据…")
     packets = _parse_packets(pkt_raw)
 
+    pcr_by_pid: dict[int, list[PcrPoint]] = {}
+    if not any(pkt.pcr_time is not None for pkt in packets):
+        notify("ffprobe 未返回 PCR，正在从 TS 传输流解析…")
+        pcr_by_pid = extract_pcr_by_pid(input_path)
+
     notify("正在整理节目数据…")
     program_series, any_downsampled, original_counts = _build_program_series(
-        streams, programs, packets, config.max_points, downsample
+        streams, programs, packets, config.max_points, downsample, pcr_by_pid=pcr_by_pid
     )
 
     return AnalysisResult(

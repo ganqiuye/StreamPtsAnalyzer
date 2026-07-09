@@ -30,6 +30,7 @@ class StreamInfo:
 class ProgramInfo:
     program_id: int
     stream_indices: list[int] = field(default_factory=list)
+    pcr_pid: int | None = None
 
     @property
     def default_video_index(self) -> int | None:
@@ -64,6 +65,24 @@ class PcrPoint:
     packet_index: int
     pcr: int | None
     pcr_time: float
+
+    @property
+    def base_90k(self) -> int:
+        if self.pcr is not None:
+            return self.pcr // 300
+        return int(round(self.pcr_time * 90_000))
+
+    @property
+    def full_27m(self) -> int:
+        if self.pcr is not None:
+            return self.pcr
+        return int(round(self.pcr_time * 27_000_000))
+
+    @property
+    def ext(self) -> int:
+        if self.pcr is not None:
+            return self.pcr - self.base_90k * 300
+        return self.full_27m - self.base_90k * 300
 
 
 @dataclass

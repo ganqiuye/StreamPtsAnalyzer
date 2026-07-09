@@ -32,6 +32,10 @@ def unit_label(unit: UnitName) -> str:
     return {"90k": "PTS (90k)", "us": "PTS (µs)", "ms": "ms", "sec": "s"}[unit]
 
 
+def pcr_unit_label(unit: UnitName) -> str:
+    return {"90k": "PCR Base (90k)", "us": "PCR (µs)", "ms": "ms", "sec": "s"}[unit]
+
+
 def format_time(seconds: float) -> str:
     if seconds < 0:
         return f"-{format_time(-seconds)}"
