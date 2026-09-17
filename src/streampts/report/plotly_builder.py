@@ -1324,6 +1324,37 @@ def _control_script(
     syncStreamToggle();
   }}
 
+  // Axes hidden with visible:false keep stale full-height drag cover rects in the
+  // top layer; they hijack mouse events so visible rows lose hover. Track collapsed
+  // subplots and disable pointer events on their drag rects (restored when re-shown).
+  function separateCollapsedSubplots() {{
+    var meta = separateMeta();
+    var vis = computeVisibility(meta);
+    var rows = {{}};
+    meta.forEach(function(m, i) {{
+      if (!rows[m.row]) rows[m.row] = false;
+      if (vis[i]) rows[m.row] = true;
+    }});
+    var collapsed = {{}};
+    Object.keys(rows).forEach(function(row) {{
+      if (!rows[row]) {{
+        var r = parseInt(row, 10);
+        collapsed[r <= 1 ? 'xy' : 'x' + r + 'y' + r] = true;
+      }}
+    }});
+    return collapsed;
+  }}
+
+  function applySeparateDragCover(gd) {{
+    if (!gd || !gd.querySelectorAll) return;
+    var collapsed = separateCollapsedSubplots();
+    gd.querySelectorAll('rect.drag[data-subplot]').forEach(function(r) {{
+      var sp = r.getAttribute('data-subplot');
+      if (collapsed[sp]) r.style.pointerEvents = 'none';
+      else if (r.style.pointerEvents === 'none') r.style.pointerEvents = '';
+    }});
+  }}
+
   function updateSeparateAxisVisibility(gd, meta, visible) {{
     if (!gd || !gd.layout) return;
     var rows = {{}};
@@ -1341,6 +1372,7 @@ def _control_script(
     var bottomRow = visRows.length ? visRows[visRows.length - 1] : 1;
     var xTitle = SEPARATE_X_TITLES[String(currentProgram)] || '';
     var rel = {{}};
+    var collapsed = {{}};
     Object.keys(rows).forEach(function(row) {{
       var r = parseInt(row, 10);
       var suffix = r <= 1 ? '' : r;
@@ -1356,9 +1388,22 @@ def _control_script(
       rel['xaxis' + suffix + '.title.text'] = show && r === bottomRow ? xTitle : '';
       if (show) {{
         rel['annotations[' + (r - 1) + '].y'] = top;
+      }} else {{
+        collapsed[r <= 1 ? 'xy' : 'x' + r + 'y' + r] = true;
       }}
     }});
-    if (Object.keys(rel).length) Plotly.relayout(gd, rel);
+    // Re-apply after the relayout promise resolves; also re-applied on every
+    // plotly_relayout (resize/wheel/pan) since Plotly may redraw the drag rects.
+    function applyDragCover() {{
+      applySeparateDragCover(gd);
+    }}
+    if (Object.keys(rel).length) {{
+      var p = Plotly.relayout(gd, rel);
+      if (p && p.then) p.then(applyDragCover);
+      else applyDragCover();
+    }} else {{
+      applyDragCover();
+    }}
   }}
 
   function unitLabel(u) {{
@@ -1690,6 +1735,12 @@ def _control_script(
   function setupPlotInteraction(gd) {{
     if (!gd || gd._streamptsInteraction) return;
     gd._streamptsInteraction = true;
+
+    // Plotly redraws drag cover rects on relayout, wiping our pointer-events
+    // overrides; re-apply them whenever the separate plot relayouts.
+    if (gd.id === 'streampts-plot-separate' && gd.on) {{
+      gd.on('plotly_relayout', function() {{ applySeparateDragCover(gd); }});
+    }}
 
     function xAxes() {{
       var keys = [];

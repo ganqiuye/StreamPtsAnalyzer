@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
+from streampts import __author__, __version__
 from streampts.analyze_service import AnalyzeError, AnalyzeOptions, apply_options_to_config, default_output, open_report_path
 from streampts.config import load_config
 from streampts.extractor.ffprobe import FfprobeError, resolve_ffprobe
@@ -49,7 +50,7 @@ class StreamPtsApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.title("Stream PTS Analyzer")
+        self.title(f"Stream PTS Analyzer v{__version__} by {__author__}")
         self.geometry("720x680")
         self.minsize(640, 600)
 

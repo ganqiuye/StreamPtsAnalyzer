@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tkinter as tk
 
+from streampts import __author__, __version__
 from streampts.gui.branding import asset_path, has_logo
 from streampts.gui.win_shell import register_application_icon
 
@@ -23,7 +24,7 @@ def _apply_window_icon(window: tk.Tk | tk.Toplevel) -> None:
 
 def _show_splash() -> tk.Tk:
     splash = tk.Tk()
-    splash.title("Stream PTS Analyzer")
+    splash.title(f"Stream PTS Analyzer v{__version__} by {__author__}")
     splash.resizable(False, False)
     splash.configure(bg="#1a1a1a")
     _apply_window_icon(splash)

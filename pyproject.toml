@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "streampts"
-version = "0.1.0"
+version = "0.2.1"
+authors = [{ name = "ganqiuye" }]
 description = "Analyze media PTS with ffprobe and interactive HTML reports"
 readme = "README.md"
 requires-python = ">=3.8"
