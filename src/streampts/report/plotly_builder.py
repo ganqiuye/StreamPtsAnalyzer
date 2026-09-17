@@ -1008,6 +1008,18 @@ def build_controls_html(
     pcr_btn = (
         '<button type="button" data-filter="pcr">PCR</button>' if has_pcr else ""
     )
+    filter_group = (
+        f"""
+  <div class="ctrl-group" id="filter-group">
+    <span class="ctrl-label">显示</span>
+    <div class="btn-group" id="stream-filter">
+      <button type="button" class="active" data-filter="all">全部</button>
+      {pcr_btn}
+    </div>
+  </div>"""
+        if has_pcr
+        else ""
+    )
     pcr_hint = (
         '<span class="dot pcr"></span> PCR 绿' if has_pcr else ""
     )
@@ -1047,15 +1059,7 @@ def build_controls_html(
       <button type="button" data-layout="separate">分开</button>
     </div>
   </div>
-  <div class="ctrl-group">
-    <span class="ctrl-label">显示</span>
-    <div class="btn-group" id="stream-filter">
-      <button type="button" class="active" data-filter="all">全部</button>
-      <button type="button" data-filter="video">Video</button>
-      <button type="button" data-filter="audio">Audio</button>
-      {pcr_btn}
-    </div>
-  </div>
+{filter_group}
   <div class="legend-hint">
     <span class="dot video"></span> Video 蓝
     <span class="dot audio"></span> Audio 红
@@ -1132,7 +1136,7 @@ def build_summary_html(
   </div>
   {notes}
   <div class="help">
-    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · PTS 悬停值与跳变标签可选十进制/十六进制 · 分开布局仅显示选中 Stream 的行并自动放大 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
+    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · PTS 悬停值与跳变标签可选十进制/十六进制 · 显示 全部/PCR 仅同图布局可用，分开布局按选中 Stream 显示行并自动放大 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
   </div>
 </header>
 """
@@ -1162,6 +1166,7 @@ body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background: #e
 .chart-wrap { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin: 12px 16px 16px; background: #fff; border-radius: 12px; box-shadow: 0 4px 20px rgba(15,23,42,0.08); overflow: hidden; }
 .chart-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; padding: 12px 16px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
 .ctrl-group { display: flex; align-items: center; gap: 8px; }
+.ctrl-group.hidden { display: none; }
 .ctrl-group label, .ctrl-label { font-size: 0.85rem; font-weight: 600; color: #475569; white-space: nowrap; }
 #program-select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; min-width: 130px; }
 .ms-wrap { position: relative; }
@@ -1247,8 +1252,6 @@ def _control_script(
   }}
 
   function kindsForFilter(filter) {{
-    if (filter === 'video') return ['video', 'jump_video', 'jump_link_video'];
-    if (filter === 'audio') return ['audio', 'jump_audio', 'jump_link_audio'];
     if (filter === 'pcr') return ['pcr'];
     var all = ['video', 'audio', 'jump_video', 'jump_audio', 'jump_link_video', 'jump_link_audio'];
     if (HAS_PCR) all.push('pcr');
@@ -1661,6 +1664,8 @@ def _control_script(
     currentLayout = mode;
     document.getElementById('plot-combined-wrap').classList.toggle('hidden', mode !== 'combined');
     document.getElementById('plot-separate-wrap').classList.toggle('hidden', mode !== 'separate');
+    var filterGroup = document.getElementById('filter-group');
+    if (filterGroup) filterGroup.classList.toggle('hidden', mode === 'separate');
 
     function finishSync() {{
       if (!plotSynced[mode]) {{
