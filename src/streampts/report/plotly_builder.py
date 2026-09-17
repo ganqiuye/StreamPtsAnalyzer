@@ -888,7 +888,10 @@ def build_separate_figure_for_program(
         ),
         margin=dict(l=56, r=24, t=48, b=48),
         paper_bgcolor="#f1f5f9",
-        plot_bgcolor="#ffffff",
+        # 透明绘图区背景：轴 visible:false 收起时 Plotly 会残留整幅白色 rect.bg
+        # 盖住可见行的网格线与 SVG 跳变标记（scattergl canvas 层不受影响），
+        # 页面 .chart-wrap 本身是白色，透明后视觉一致且残留矩形不再遮挡内容。
+        plot_bgcolor="rgba(0,0,0,0)",
         uirevision=f"streampts-separate-{prog_idx}",
     )
 
@@ -1085,7 +1088,7 @@ def build_summary_html(
   </div>
   {notes}
   <div class="help">
-    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · 分开布局按 Stream 分行 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
+    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · 分开布局仅显示选中 Stream 的行并自动放大 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
   </div>
 </header>
 """
@@ -1151,7 +1154,7 @@ def _control_script(
     meta_combined: list[dict],
     meta_separate_by_program: dict[str, list[dict]],
     programs_catalog: list[dict],
-    separate_heights: dict[str, int],
+    separate_x_titles: dict[str, str],
     default_program: int,
     has_pcr_data: bool,
     has_negative_pts: bool,
@@ -1166,7 +1169,7 @@ def _control_script(
     separate: {json.dumps(meta_separate_by_program)}
   }};
   var PROGRAMS = {json.dumps(programs_catalog)};
-  var SEPARATE_HEIGHTS = {json.dumps(separate_heights)};
+  var SEPARATE_X_TITLES = {json.dumps(separate_x_titles)};
   var HAS_PCR = {json.dumps(has_pcr_data)};
   var HAS_NEGATIVE_PTS = {json.dumps(has_negative_pts)};
   var US_TO_90K = {US_TO_90K};
@@ -1280,13 +1283,32 @@ def _control_script(
       if (!rows[m.row]) rows[m.row] = false;
       if (visible[i]) rows[m.row] = true;
     }});
+    var visRows = Object.keys(rows)
+      .filter(function(r) {{ return rows[r]; }})
+      .map(function(r) {{ return parseInt(r, 10); }})
+      .sort(function(a, b) {{ return a - b; }});
+    var nVis = visRows.length || 1;
+    var gap = 0.03;
+    var rowH = (1 - (nVis - 1) * gap) / nVis;
+    var bottomRow = visRows.length ? visRows[visRows.length - 1] : 1;
+    var xTitle = SEPARATE_X_TITLES[String(currentProgram)] || '';
     var rel = {{}};
     Object.keys(rows).forEach(function(row) {{
       var r = parseInt(row, 10);
       var suffix = r <= 1 ? '' : r;
-      var show = rows[row];
+      var idx = visRows.indexOf(r);
+      var show = idx >= 0;
+      var top = show ? 1 - idx * (rowH + gap) : 0;
+      var bottom = show ? top - rowH : 0.0001;
+      rel['yaxis' + suffix + '.domain[0]'] = bottom;
+      rel['yaxis' + suffix + '.domain[1]'] = top;
       rel['yaxis' + suffix + '.visible'] = show;
       rel['xaxis' + suffix + '.visible'] = show;
+      rel['annotations[' + (r - 1) + '].visible'] = show;
+      rel['xaxis' + suffix + '.title.text'] = show && r === bottomRow ? xTitle : '';
+      if (show) {{
+        rel['annotations[' + (r - 1) + '].y'] = top;
+      }}
     }});
     if (Object.keys(rel).length) Plotly.relayout(gd, rel);
   }}
@@ -1419,6 +1441,9 @@ def _control_script(
 
   function applyVisibility() {{
     syncPlot(activePlotKey(), {{ unit: false }});
+    if (activePlotKey() === 'separate') {{
+      requestAnimationFrame(function() {{ resizePlot('separate'); }});
+    }}
     markOtherPlotStale();
   }}
 
@@ -1434,8 +1459,19 @@ def _control_script(
     return document.getElementById(key === 'combined' ? 'plot-combined-wrap' : 'plot-separate-wrap');
   }}
 
+  function separateVisibleRowCount() {{
+    var meta = separateMeta();
+    var vis = computeVisibility(meta);
+    var rows = [];
+    meta.forEach(function(m, i) {{
+      if (vis[i] && rows.indexOf(m.row) < 0) rows.push(m.row);
+    }});
+    return rows.length || 1;
+  }}
+
   function separateMinHeight() {{
-    return SEPARATE_HEIGHTS[String(currentProgram)] || 320;
+    var n = separateVisibleRowCount();
+    return Math.max(320, Math.min(1400, 120 * n + 80));
   }}
 
   function availablePlotHeight(key) {{
@@ -1808,11 +1844,11 @@ def generate_report_html(
     combined_spec = json.loads(fig_c_json)
     separate_specs: dict[str, dict] = {}
     meta_separate: dict[str, list] = {}
-    separate_heights: dict[str, int] = {}
+    separate_x_titles: dict[str, str] = {}
     for i, (ps, diag) in enumerate(
         zip(analysis.program_series, diagnostics_by_program)
     ):
-        fig_s, meta_s, _, height = build_separate_figure_for_program(
+        fig_s, meta_s, _, _height = build_separate_figure_for_program(
             ps,
             diag,
             analysis.streams,
@@ -1826,7 +1862,9 @@ def generate_report_html(
             raise ValueError(f"节目 {i} 图表序列化失败")
         separate_specs[str(i)] = json.loads(fig_json)
         meta_separate[str(i)] = meta_s
-        separate_heights[str(i)] = height
+        separate_x_titles[str(i)] = (
+            "Timeline (s)" if _program_uses_timeline(ps) else "Time (s)"
+        )
     has_negative_pts = has_neg_c or any(
         _meta_has_negative_pts(m) for m in meta_separate.values()
     )
@@ -1863,7 +1901,7 @@ window.STREAMPTS_PLOT_CONFIG = {plot_config_json};
 {separate_panel}
 </div>
 {plot_specs_script}
-{_control_script(meta_c, meta_separate, programs_catalog, separate_heights, default_program, has_pcr_data, has_negative_pts, default_unit)}
+{_control_script(meta_c, meta_separate, programs_catalog, separate_x_titles, default_program, has_pcr_data, has_negative_pts, default_unit)}
 </body>
 </html>
 """
