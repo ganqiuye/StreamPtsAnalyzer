@@ -63,6 +63,27 @@ PTS_HOVER_SEGMENTED_TEMPLATE = (
     "<extra></extra>"
 )
 
+PTS_HOVER_TEMPLATE_HEX = (
+    "%{customdata[0]}<br>"
+    "Time: %{customdata[1]}<br>"
+    "PTS: %{customdata[8]} (90k) | %{customdata[3]} (µs)<br>"
+    "DTS: %{customdata[9]}<br>"
+    "Packet #%{customdata[5]}<br>"
+    "Flags: %{customdata[6]}"
+    "<extra></extra>"
+)
+
+PTS_HOVER_SEGMENTED_TEMPLATE_HEX = (
+    "%{customdata[0]}<br>"
+    "Timeline: %{customdata[1]}<br>"
+    "PTS Time: %{customdata[7]}<br>"
+    "PTS: %{customdata[8]} (90k) | %{customdata[3]} (µs)<br>"
+    "DTS: %{customdata[9]}<br>"
+    "Packet #%{customdata[5]}<br>"
+    "Flags: %{customdata[6]}"
+    "<extra></extra>"
+)
+
 PCR_HOVER_TEMPLATE = (
     "%{customdata[0]}<br>"
     "Time: %{customdata[1]}<br>"
@@ -233,6 +254,8 @@ def _pts_customdata(
                 str(p.packet_index),
                 p.flags or "—",
                 raw_time if segmented else "",
+                f"0x{p.pts:X}",
+                f"0x{p.dts:X}" if p.dts is not None else "N/A",
             ]
         )
     return rows
@@ -354,6 +377,7 @@ class _FigureBuilder:
         stream_index: int | None = None,
         customdata: list[list] | None = None,
         hover_template: str = PTS_HOVER_TEMPLATE,
+        hover_template_hex: str = PTS_HOVER_TEMPLATE_HEX,
         secondary_y: bool = False,
         default_unit: UnitName = "us",
     ) -> None:
@@ -374,7 +398,12 @@ class _FigureBuilder:
             secondary_y=secondary_y,
             program=program,
             kind=kind,
-            extra_meta={"pts_pairs": pairs, "stream_index": stream_index},
+            extra_meta={
+                "pts_pairs": pairs,
+                "stream_index": stream_index,
+                "hover_dec": hover_template,
+                "hover_hex": hover_template_hex,
+            },
         )
 
     def add_interval_line(
@@ -549,6 +578,9 @@ def _add_program_traces(
         chart_x = _chart_x_values(display, timeline_x)
         time_lookup = continuous_time_lookup(vpts) if segmented else None
         hover_tpl = PTS_HOVER_SEGMENTED_TEMPLATE if segmented else PTS_HOVER_TEMPLATE
+        hover_tpl_hex = (
+            PTS_HOVER_SEGMENTED_TEMPLATE_HEX if segmented else PTS_HOVER_TEMPLATE_HEX
+        )
         builder.add_pts(
             f"{prog_label} Video #{vidx}",
             chart_x,
@@ -562,6 +594,7 @@ def _add_program_traces(
                 display, streams, timeline_x=timeline_x, segmented=segmented
             ),
             hover_template=hover_tpl,
+            hover_template_hex=hover_tpl_hex,
             default_unit=default_unit,
         )
         ev = diag.stream_diagnostics.get(vidx)
@@ -588,6 +621,9 @@ def _add_program_traces(
         chart_x = _chart_x_values(display, timeline_x)
         time_lookup = continuous_time_lookup(apts) if segmented else None
         hover_tpl = PTS_HOVER_SEGMENTED_TEMPLATE if segmented else PTS_HOVER_TEMPLATE
+        hover_tpl_hex = (
+            PTS_HOVER_SEGMENTED_TEMPLATE_HEX if segmented else PTS_HOVER_TEMPLATE_HEX
+        )
         builder.add_pts(
             f"{prog_label} Audio #{aidx}",
             chart_x,
@@ -601,6 +637,7 @@ def _add_program_traces(
                 display, streams, timeline_x=timeline_x, segmented=segmented
             ),
             hover_template=hover_tpl,
+            hover_template_hex=hover_tpl_hex,
             default_unit=default_unit,
         )
         ev = diag.stream_diagnostics.get(aidx)
@@ -997,6 +1034,13 @@ def build_controls_html(
     </div>
   </div>
   <div class="ctrl-group">
+    <span class="ctrl-label">PTS 格式</span>
+    <div class="btn-group" id="fmt-mode">
+      <button type="button" class="active" data-fmt="dec">十进制</button>
+      <button type="button" data-fmt="hex">十六进制</button>
+    </div>
+  </div>
+  <div class="ctrl-group">
     <span class="ctrl-label">布局</span>
     <div class="btn-group" id="layout-mode">
       <button type="button" class="active" data-layout="combined">同图</button>
@@ -1088,7 +1132,7 @@ def build_summary_html(
   </div>
   {notes}
   <div class="help">
-    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · 分开布局仅显示选中 Stream 的行并自动放大 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
+    <b>操作：</b>默认以散点显示各 PTS · 可选 Program / 多选 Stream · PTS 悬停值与跳变标签可选十进制/十六进制 · 分开布局仅显示选中 Stream 的行并自动放大 · 多段重复 PTS 时 X 轴为连续 Timeline · 滚轮缩放 · 左/右键平移
   </div>
 </header>
 """
@@ -1180,6 +1224,7 @@ def _control_script(
   var currentLayout = 'combined';
   var currentUnit = {json.dumps(initial_unit)};
   var previousUnit = currentUnit;
+  var currentFmt = 'dec';
   var plotSynced = {{ combined: false, separate: false }};
   var combinedPlotBuilt = false;
   var separatePlotBuilt = false;
@@ -1377,6 +1422,38 @@ def _control_script(
     return y;
   }}
 
+  function markerTexts(jumps) {{
+    var out = [];
+    jumps.forEach(function(j) {{
+      if (currentFmt === 'hex') {{
+        out.push('0x' + Number(j[1]).toString(16).toUpperCase());
+        out.push('0x' + Number(j[3]).toString(16).toUpperCase());
+      }} else {{
+        out.push(currentUnit === 'us' ? String(Math.round(j[0] * 1000000)) : String(j[1]));
+        out.push(currentUnit === 'us' ? String(Math.round(j[2] * 1000000)) : String(j[3]));
+      }}
+    }});
+    return out;
+  }}
+
+  function applyFmtToPlot(gd, key) {{
+    if (!gd || !gd.data) return;
+    var meta = key === 'separate' ? separateMeta() : META.combined;
+    var hIdx = [], hts = [], tIdx = [], texts = [];
+    meta.forEach(function(m, i) {{
+      if (m.pts_pairs) {{
+        hIdx.push(i);
+        hts.push(currentFmt === 'hex' ? m.hover_hex : m.hover_dec);
+      }}
+      if (m.jumps && m.jump_kind === 'marker') {{
+        tIdx.push(i);
+        texts.push(markerTexts(m.jumps));
+      }}
+    }});
+    if (hIdx.length) Plotly.restyle(gd, {{ hovertemplate: hts }}, hIdx);
+    if (tIdx.length) Plotly.restyle(gd, {{ text: texts }}, tIdx);
+  }}
+
   function applyUnitToPlot(gd, key, fromUnit) {{
     if (!gd || !gd.data) return;
     var meta = key === 'separate' ? separateMeta() : META.combined;
@@ -1393,7 +1470,7 @@ def _control_script(
         }} else if (m.jump_kind === 'marker') {{
           var markerY = jumpMarkerY(m.jumps, currentUnit);
           ys.push(markerY);
-          texts.push(markerY.map(String));
+          texts.push(markerTexts(m.jumps));
           yIdx.push(i);
           tIdx.push(i);
         }}
@@ -1429,6 +1506,7 @@ def _control_script(
     function afterVisibility() {{
       if (key === 'separate') updateSeparateAxisVisibility(gd, meta, vis);
       if (opts.unit) applyUnitToPlot(gd, key, opts.fromUnit || previousUnit);
+      if (opts.fmt) applyFmtToPlot(gd, key);
     }}
 
     if (opts.visibility !== false) {{
@@ -1452,6 +1530,11 @@ def _control_script(
     var fromUnit = previousUnit;
     previousUnit = currentUnit;
     syncPlot(key, {{ visibility: false, unit: true, fromUnit: fromUnit }});
+    markOtherPlotStale();
+  }}
+
+  function applyFmtSwitch() {{
+    syncPlot(activePlotKey(), {{ visibility: false, fmt: true }});
     markOtherPlotStale();
   }}
 
@@ -1581,7 +1664,7 @@ def _control_script(
 
     function finishSync() {{
       if (!plotSynced[mode]) {{
-        syncPlot(mode, {{ unit: true, fromUnit: previousUnit }});
+        syncPlot(mode, {{ unit: true, fromUnit: previousUnit, fmt: true }});
       }} else {{
         syncPlot(mode, {{ unit: false }});
       }}
@@ -1775,6 +1858,14 @@ def _control_script(
         btn.classList.add('active');
         currentUnit = btn.getAttribute('data-unit');
         applyUnitSwitch();
+      }});
+    }});
+    document.querySelectorAll('#fmt-mode button').forEach(function(btn) {{
+      btn.addEventListener('click', function() {{
+        document.querySelectorAll('#fmt-mode button').forEach(function(b) {{ b.classList.remove('active'); }});
+        btn.classList.add('active');
+        currentFmt = btn.getAttribute('data-fmt');
+        applyFmtSwitch();
       }});
     }});
     document.querySelectorAll('#layout-mode button').forEach(function(btn) {{
